@@ -12,13 +12,16 @@ pi install npm:pi-google-search
 
 ## Setup
 
-Set your Gemini API key:
+Two auth options:
 
+### Option 1: API Key (standard pricing)
 ```bash
 export GEMINI_API_KEY=your_key
 ```
-
 Get one at [Google AI Studio](https://aistudio.google.com/apikey).
+
+### Option 2: Google OAuth (free — uses Cloud Code Assist credits)
+Log in to Google in pi. The extension auto-detects the `google-gemini-cli` OAuth token — no API key needed. Uses Google Cloud Code Assist credits which are included free with any Google Cloud account.
 
 ## Usage
 
@@ -47,8 +50,12 @@ google_search({ query: "Next.js 15 app router changes" })
 
 | Environment Variable | Description | Default |
 |---|---|---|
-| `GEMINI_API_KEY` | **Required.** Your Gemini API key | — |
+| `GEMINI_API_KEY` | Gemini API key (option 1) | — |
 | `GEMINI_SEARCH_MODEL` | Gemini model to use | `gemini-2.5-flash` |
+
+If neither `GEMINI_API_KEY` nor Google OAuth is configured, the tool will show an error with setup instructions.
+
+The TUI renderer shows which auth method is active: `api_key` or `free` (OAuth).
 
 ## License
 

@@ -7,7 +7,9 @@
  * Based on GSD-2's google-search extension (https://github.com/gsd-build/gsd-2)
  * Adapted for standalone use as a pi package.
  *
- * Requires GEMINI_API_KEY environment variable.
+ * Auth options:
+ *   1. GEMINI_API_KEY env var (standard Gemini API pricing)
+ *   2. Google OAuth via `pi --provider google-gemini-cli` login (free Cloud Code Assist credits)
  */
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
@@ -40,10 +42,11 @@ interface SearchDetails {
 	sourceCount: number;
 	cached: boolean;
 	durationMs: number;
+	authMethod?: "api_key" | "oauth";
 	error?: string;
 }
 
-// ── Lazy singleton client ────────────────────────────────────────────────────
+// ── Lazy singleton client (for API key auth) ─────────────────────────────────
 
 type GoogleGenAIClient = {
 	models: {
@@ -66,6 +69,146 @@ async function getClient(): Promise<GoogleGenAIClient> {
 		client = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
 	}
 	return client;
+}
+
+// ── API key search ───────────────────────────────────────────────────────────
+
+async function searchWithApiKey(
+	query: string,
+	signal?: AbortSignal,
+): Promise<SearchResult> {
+	const ai = await getClient();
+	const model = process.env.GEMINI_SEARCH_MODEL || "gemini-2.5-flash";
+
+	const timeoutController = new AbortController();
+	const timeoutId = setTimeout(() => timeoutController.abort(), 30_000);
+	const combinedSignal = signal
+		? AbortSignal.any([signal, timeoutController.signal])
+		: timeoutController.signal;
+
+	let response;
+	try {
+		response = await ai.models.generateContent({
+			model,
+			contents: query,
+			config: {
+				tools: [{ googleSearch: {} }],
+				abortSignal: combinedSignal,
+			},
+		});
+	} finally {
+		clearTimeout(timeoutId);
+	}
+
+	return parseGeminiResponse(response);
+}
+
+// ── OAuth search (Cloud Code Assist — free) ──────────────────────────────────
+
+async function searchWithOAuth(
+	query: string,
+	accessToken: string,
+	projectId: string,
+	signal?: AbortSignal,
+): Promise<SearchResult> {
+	const model = process.env.GEMINI_SEARCH_MODEL || "gemini-2.5-flash";
+	const url = "https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent";
+
+	const executeFetch = async (retries = 3): Promise<Response> => {
+		const response = await fetch(url, {
+			method: "POST",
+			headers: {
+				Authorization: `Bearer ${accessToken}`,
+				"Content-Type": "application/json",
+				"User-Agent": "google-cloud-sdk vscode_cloudshelleditor/0.1",
+				"X-Goog-Api-Client": "gl-node/22.17.0",
+				"Client-Metadata": JSON.stringify({
+					ideType: "IDE_UNSPECIFIED",
+					platform: "PLATFORM_UNSPECIFIED",
+					pluginType: "GEMINI",
+				}),
+			},
+			body: JSON.stringify({
+				project: projectId,
+				model,
+				request: {
+					contents: [{ parts: [{ text: query }] }],
+					tools: [{ googleSearch: {} }],
+				},
+			}),
+			signal,
+		});
+
+		if (!response.ok && retries > 0 && (response.status === 429 || response.status >= 500)) {
+			await new Promise((resolve) => setTimeout(resolve, 1000 * (4 - retries)));
+			return executeFetch(retries - 1);
+		}
+
+		return response;
+	};
+
+	const response = await executeFetch();
+
+	if (!response.ok) {
+		const errorText = await response.text();
+		throw new Error(`Cloud Code Assist API error (${response.status}): ${errorText}`);
+	}
+
+	const text = await response.text();
+	const jsonLines = text.split("\n")
+		.filter(l => l.startsWith("data:"))
+		.map(l => l.slice(5).trim())
+		.filter(l => l.length > 0);
+
+	let data;
+	if (jsonLines.length > 0) {
+		data = JSON.parse(jsonLines[jsonLines.length - 1]);
+	} else {
+		data = JSON.parse(text);
+	}
+
+	const candidate = data.response?.candidates?.[0];
+	const answer = candidate?.content?.parts?.find((p: any) => p.text)?.text ?? "";
+	const grounding = candidate?.groundingMetadata;
+
+	return {
+		answer,
+		sources: extractSources(grounding),
+		searchQueries: grounding?.webSearchQueries ?? [],
+		cached: false,
+	};
+}
+
+// ── Shared helpers ───────────────────────────────────────────────────────────
+
+function extractSources(grounding: any): SearchSource[] {
+	const sources: SearchSource[] = [];
+	const seenTitles = new Set<string>();
+	if (grounding?.groundingChunks) {
+		for (const chunk of grounding.groundingChunks) {
+			if (chunk.web) {
+				const title = chunk.web.title ?? "Untitled";
+				if (seenTitles.has(title)) continue;
+				seenTitles.add(title);
+				const domain = chunk.web.domain ?? title;
+				sources.push({ title, uri: chunk.web.uri ?? "", domain });
+			}
+		}
+	}
+	return sources;
+}
+
+function parseGeminiResponse(response: any): SearchResult {
+	const answer = response.text ?? "";
+	const candidate = response.candidates?.[0];
+	const grounding = candidate?.groundingMetadata;
+
+	return {
+		answer,
+		sources: extractSources(grounding),
+		searchQueries: grounding?.webSearchQueries ?? [],
+		cached: false,
+	};
 }
 
 // ── In-session cache ─────────────────────────────────────────────────────────
@@ -144,14 +287,39 @@ export default function (pi: ExtensionAPI) {
 			),
 		}),
 
-		async execute(_toolCallId, params, signal) {
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			const startTime = Date.now();
 			const maxSources = Math.min(Math.max(params.maxSources ?? 5, 1), 10);
 
-			if (!process.env.GEMINI_API_KEY) {
+			// Resolve auth method
+			let authMethod: "api_key" | "oauth" | null = null;
+			let oauthToken: string | undefined;
+			let projectId: string | undefined;
+
+			if (process.env.GEMINI_API_KEY) {
+				authMethod = "api_key";
+			} else {
+				// Try OAuth via pi's auth storage (Cloud Code Assist — free)
+				const oauthRaw = await ctx.modelRegistry.getApiKeyForProvider("google-gemini-cli");
+				if (oauthRaw) {
+					try {
+						const parsed = JSON.parse(oauthRaw);
+						oauthToken = parsed.token;
+						projectId = parsed.projectId;
+						if (oauthToken && projectId) {
+							authMethod = "oauth";
+						}
+					} catch {
+						// Invalid JSON, fall through
+					}
+				}
+			}
+
+			if (!authMethod) {
 				throw new Error(
-					"GEMINI_API_KEY not set. Export it in your shell to use google_search.\n\n" +
-					"Example: export GEMINI_API_KEY=your_key"
+					"No authentication found for Google Search.\n\n" +
+					"Option 1 (paid): export GEMINI_API_KEY=your_key\n" +
+					"Option 2 (free): Log in via Google OAuth in pi (uses Cloud Code Assist credits)"
 				);
 			}
 
@@ -167,55 +335,19 @@ export default function (pi: ExtensionAPI) {
 						sourceCount: cached.sources.length,
 						cached: true,
 						durationMs: Date.now() - startTime,
+						authMethod,
 					} as SearchDetails,
 				};
 			}
 
-			// Call Gemini with Google Search grounding
+			// Execute search
 			let result: SearchResult;
 			try {
-				const ai = await getClient();
-
-				const timeoutController = new AbortController();
-				const timeoutId = setTimeout(() => timeoutController.abort(), 30_000);
-				const combinedSignal = signal
-					? AbortSignal.any([signal, timeoutController.signal])
-					: timeoutController.signal;
-
-				let response;
-				try {
-					response = await ai.models.generateContent({
-						model: process.env.GEMINI_SEARCH_MODEL || "gemini-2.5-flash",
-						contents: params.query,
-						config: {
-							tools: [{ googleSearch: {} }],
-							abortSignal: combinedSignal,
-						},
-					});
-				} finally {
-					clearTimeout(timeoutId);
+				if (authMethod === "api_key") {
+					result = await searchWithApiKey(params.query, signal);
+				} else {
+					result = await searchWithOAuth(params.query, oauthToken!, projectId!, signal);
 				}
-
-				const answer = response.text ?? "";
-				const candidate = response.candidates?.[0];
-				const grounding = candidate?.groundingMetadata;
-
-				const sources: SearchSource[] = [];
-				const seenTitles = new Set<string>();
-				if (grounding?.groundingChunks) {
-					for (const chunk of grounding.groundingChunks) {
-						if (chunk.web) {
-							const title = chunk.web.title ?? "Untitled";
-							if (seenTitles.has(title)) continue;
-							seenTitles.add(title);
-							const domain = chunk.web.domain ?? title;
-							sources.push({ title, uri: chunk.web.uri ?? "", domain });
-						}
-					}
-				}
-
-				const searchQueries = grounding?.webSearchQueries ?? [];
-				result = { answer, sources, searchQueries, cached: false };
 			} catch (err: unknown) {
 				const msg = err instanceof Error ? err.message : String(err);
 
@@ -253,6 +385,7 @@ export default function (pi: ExtensionAPI) {
 					sourceCount: result.sources.length,
 					cached: false,
 					durationMs: Date.now() - startTime,
+					authMethod,
 				} as SearchDetails,
 			};
 		},
@@ -272,7 +405,9 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			let text = theme.fg("success", `${d?.sourceCount ?? 0} sources`);
-			text += theme.fg("dim", ` (${d?.durationMs ?? 0}ms)`);
+			text += theme.fg("dim", ` (${d?.durationMs ?? 0}ms`);
+			if (d?.authMethod) text += theme.fg("dim", ` · ${d.authMethod === "oauth" ? "free" : "api_key"}`);
+			text += theme.fg("dim", ")");
 			if (d?.cached) text += theme.fg("dim", " · cached");
 
 			if (expanded) {
@@ -300,9 +435,12 @@ export default function (pi: ExtensionAPI) {
 	// ── Startup check ────────────────────────────────────────────────────────
 
 	pi.on("session_start", async (_event, ctx) => {
-		if (!process.env.GEMINI_API_KEY) {
+		if (process.env.GEMINI_API_KEY) return;
+
+		const hasOAuth = await ctx.modelRegistry.authStorage.hasAuth("google-gemini-cli");
+		if (!hasOAuth) {
 			ctx.ui.notify(
-				"google_search: GEMINI_API_KEY not set. Export it to enable web search.",
+				"google_search: No auth found. Set GEMINI_API_KEY or log in via Google OAuth.",
 				"warning",
 			);
 		}
