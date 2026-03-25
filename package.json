@@ -1,15 +1,22 @@
 {
   "name": "pi-google-search",
   "version": "1.0.0",
-  "description": "Google Search extension for pi coding agent — web search via Gemini grounded search",
+  "description": "Google Search extension for the pi coding agent. Gemini-grounded web search with AI answers, citations, and source URLs.",
   "type": "module",
   "keywords": [
     "pi-package",
     "pi-extension",
-    "pi",
+    "pi-coding-agent",
     "google-search",
     "gemini",
-    "web-search"
+    "gemini-api",
+    "web-search",
+    "grounded-search",
+    "ai-agent",
+    "coding-agent",
+    "llm-tools",
+    "citations",
+    "typescript"
   ],
   "author": "sshkeda",
   "license": "MIT",
