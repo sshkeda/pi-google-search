@@ -1,0 +1,35 @@
+{
+  "name": "pi-google-search",
+  "version": "1.0.0",
+  "description": "Google Search extension for pi coding agent — web search via Gemini grounded search",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi",
+    "google-search",
+    "gemini",
+    "web-search"
+  ],
+  "author": "sshkeda",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sshkeda/pi-google-search.git"
+  },
+  "homepage": "https://github.com/sshkeda/pi-google-search#readme",
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  },
+  "scripts": {
+    "clean": "echo 'nothing to clean'",
+    "build": "echo 'nothing to build'",
+    "check": "echo 'nothing to check'"
+  },
+  "dependencies": {
+    "@google/genai": "^1.40.0"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*"
+  }
+}
