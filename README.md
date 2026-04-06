@@ -1,6 +1,5 @@
 # pi-google-search
 
-[![npm version](https://img.shields.io/npm/v/pi-google-search)](https://www.npmjs.com/package/pi-google-search)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Give your [pi](https://github.com/badlogic/pi-mono) coding agent real-time web search — powered by Gemini's grounded search. Returns AI-synthesized answers with cited source URLs. Free to use with Google OAuth.
